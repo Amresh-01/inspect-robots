@@ -528,7 +528,7 @@ def _run_eval(
     halted = False
     stopped = False
     cancelled_exc: _CancelledTrial | None = None
-    halt_exc: BaseException | None = None
+    hook_halt_exc: BaseException | None = None
     # A proportion threshold is a share of the whole eval, so the denominator is
     # every trial the run intends to attempt. Using the completed-so-far count
     # made the first error 1/1 = 100%, which trips any threshold below 1.
@@ -599,7 +599,6 @@ def _run_eval(
                     scene_status = "error"
                     scene_error = error
                     halted = True
-                    halt_exc = exc
                     record = exc.record
                 except PolicyError as exc:
                     error_count += 1
@@ -660,7 +659,7 @@ def _run_eval(
                         scene_status = "error"
                         scene_error = error
                         halted = True
-                        halt_exc = exc
+                        hook_halt_exc = exc
 
                         record.status = "error"
                         record.error = scene_error
@@ -843,8 +842,8 @@ def _run_eval(
     bus.on_eval_end(log)
     if cancelled_exc is not None:
         raise cancelled_exc
-    if halt_exc is not None:
-        raise halt_exc
+    if hook_halt_exc is not None:
+        raise hook_halt_exc
     return [log]
 
 

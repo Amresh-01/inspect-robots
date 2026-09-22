@@ -1704,8 +1704,9 @@ def test_hookless_policy_yields_all_none_transcripts(tmp_path: Path) -> None:
 
 def test_eval_set_halts_on_before_scoring_fault(tmp_path: Path) -> None:
     for error in (SafetyAbort("stop"), EmbodimentFault("stop")):
-        def bad_hook(record: TrialRecord, scene: Scene) -> None:
-            raise error
+
+        def bad_hook(record: TrialRecord, scene: Scene, err: BaseException = error) -> None:
+            raise err
 
         with pytest.raises(type(error)):
             eval_set(
@@ -1718,7 +1719,7 @@ def test_eval_set_halts_on_before_scoring_fault(tmp_path: Path) -> None:
 
         logs_on_disk = list(tmp_path.glob("*.json"))
         assert len(logs_on_disk) == 1
-        
+
         log = read_eval_log(str(logs_on_disk[0]))
         assert log.status == "error"
         for f in logs_on_disk:
@@ -1744,6 +1745,7 @@ def test_eval_set_halts_on_observe_parked_fault(tmp_path: Path) -> None:
         assert log.status == "error"
         for f in logs_on_disk:
             f.unlink()
+
 
 def test_policy_bind_task_hook_receives_task_envelope(tmp_path: Path) -> None:
     class _TaskAwarePolicy:
