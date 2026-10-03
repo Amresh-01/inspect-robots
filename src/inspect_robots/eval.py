@@ -706,7 +706,8 @@ def _run_eval(
                                             warnings.warn(
                                                 "embodiment.observe_parked() returned "
                                                 f"{type(parked_observation).__name__}; expected "
-                                                "Observation or None; grading from last-step frames",
+                                                "Observation or None"
+                                                "; grading from last-step frames",
                                                 RuntimeWarning,
                                                 stacklevel=2,
                                             )
