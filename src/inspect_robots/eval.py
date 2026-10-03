@@ -193,7 +193,9 @@ def _git_commit() -> str | None:
         return None
     commit = head.stdout.strip()
     tree = _git("status", "--porcelain")
-    if tree is not None and tree.returncode == 0 and tree.stdout.strip():
+    if tree is None or tree.returncode != 0:
+        return None
+    if tree.stdout.strip():
         commit += "-dirty"
     return commit
 
@@ -264,6 +266,25 @@ class _Broadcast:
             s.on_eval_end(log)
 
 
+def _survivor_warning(log: EvalLog) -> str | None:
+    """Describe a "success" whose metrics no clean scene backs, else ``None``.
+
+    ``fail_on_error`` decides whether errored trials fail the run. When it
+    tolerates them yet every scene errored, the metrics rest on whichever
+    trials survived and can look entirely ordinary (issue #440), so callers
+    and readers are warned instead of the status being overridden.
+    """
+    if log.status != "success" or not log.samples:
+        return None
+    if any(scene.status != "error" for scene in log.samples):
+        return None
+    errored, total = log.results.errored_trials, log.results.total_trials
+    return (
+        f"no scene completed cleanly ({errored} of {total} trial(s) errored); "
+        "metrics may rest on a surviving minority of trials"
+    )
+
+
 def eval(
     task: Task | str,
     policy: Policy | str,
@@ -307,7 +328,10 @@ def eval(
     empty entry in ``SceneResult.epochs``.
 
     A run in which **every** trial errored (nothing was scored) always ends
-    with ``status == "error"``, regardless of ``fail_on_error``.
+    with ``status == "error"``, regardless of ``fail_on_error``. A run in which
+    no scene completed cleanly keeps the status ``fail_on_error`` gives it, but
+    emits a ``UserWarning`` (issue #440): its metrics may rest on a surviving
+    minority of trials.
 
     Ctrl-C during a rollout records the partial trial and writes a log with
     ``status == "cancelled"``, then re-raises the interrupt (as a
@@ -524,6 +548,7 @@ def _run_eval(
     error: str | None = None
     error_count = 0
     errored_trials = 0
+    abstentions: dict[str, int] = {}
 
     halted = False
     stopped = False
@@ -535,7 +560,7 @@ def _run_eval(
     planned_trials = len(task.scenes) * epoch_spec.count
     for scene in task.scenes:
         per_scorer_scores: dict[str, list[Score]] = {s.name: [] for s in scorers}
-        epoch_dicts: list[dict[str, float]] = []
+        epoch_dicts: list[dict[str, float | None]] = []
         judgements: list[str | None] = []
         judgement_sources: list[str | None] = []
         notes: list[str | None] = []
@@ -675,7 +700,7 @@ def _run_eval(
                     judgement_sources.append(None)
                     notes.append(None)
                 else:
-                    epoch_values: dict[str, float] = {}
+                    epoch_values: dict[str, float | None] = {}
                     for scorer in scorers:
                         try:
                             score = scorer(record, scene.target)
@@ -699,6 +724,8 @@ def _run_eval(
                             continue
                         per_scorer_scores[scorer.name].append(score)
                         epoch_values[scorer.name] = value
+                        if value is None:
+                            abstentions[scorer.name] = abstentions.get(scorer.name, 0) + 1
                     epoch_dicts.append(epoch_values)
                     # Captured at the same instant as the judgement, on purpose:
                     # these fields are documented as strictly parallel, so a later
@@ -764,7 +791,7 @@ def _run_eval(
                 stopped = True
                 break
 
-        reduced: dict[str, float] = {}
+        reduced: dict[str, float | None] = {}
         for name, scene_scores in per_scorer_scores.items():
             if not scene_scores:
                 continue
@@ -811,11 +838,14 @@ def _run_eval(
         status = "error"
         error = f"all {total_trials} trial(s) errored; nothing was scored"
 
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float | None] = {}
     for scorer in scorers:
         vals = [sr.reduced[scorer.name] for sr in scene_results if scorer.name in sr.reduced]
         if vals:
-            metrics[scorer.name] = mean(vals)
+            # Abstentions carry no verdict, so they are left out of the mean;
+            # a scorer that abstained on every scene reports None, not 0.0.
+            voted = [v for v in vals if v is not None]
+            metrics[scorer.name] = mean(voted) if voted else None
 
     stats = EvalStats(
         started_at=started_iso,
@@ -834,12 +864,16 @@ def _run_eval(
             total_trials=total_trials,
             metrics=metrics,
             errored_trials=errored_trials,
+            abstentions=abstentions,
         ),
         stats=stats,
         samples=tuple(scene_results),
         error=error,
     )
     bus.on_eval_end(log)
+    survivor_warning = _survivor_warning(log)
+    if survivor_warning is not None:
+        warnings.warn(survivor_warning, UserWarning, stacklevel=3)
     if cancelled_exc is not None:
         raise cancelled_exc
     if hook_halt_exc is not None:
@@ -870,6 +904,15 @@ def _component_name(component: Policy | Embodiment) -> str:
         return type(component).__name__
 
 
+def _safe_info_attr(component: object, attr: str) -> str | None:
+    try:
+        info = getattr(component, "info", None)
+        value = getattr(info, attr, None)
+        return str(value) if value is not None else None
+    except Exception:
+        return None
+
+
 def _error_log_for(
     task: Task | str,
     policy: Policy | str,
@@ -877,6 +920,9 @@ def _error_log_for(
     *,
     seed: int | None,
     exc: Exception,
+    environment_id: str | None = None,
+    environment_revision: str | None = None,
+    policy_checkpoint: str | None = None,
 ) -> EvalLog:
     """Describe a task failure that occurred before or outside log production."""
     now = _now_iso()
@@ -893,6 +939,20 @@ def _error_log_for(
             seed=seed,
             max_steps=None if isinstance(task, str) else task.max_steps,
             max_seconds=None if isinstance(task, str) else task.max_seconds,
+            environment_id=environment_id
+            or (
+                _safe_info_attr(embodiment, "environment_id")
+                if not isinstance(embodiment, str)
+                else None
+            ),
+            environment_revision=environment_revision
+            or (
+                _safe_info_attr(embodiment, "environment_revision")
+                if not isinstance(embodiment, str)
+                else None
+            ),
+            policy_checkpoint=policy_checkpoint
+            or (_safe_info_attr(policy, "checkpoint") if not isinstance(policy, str) else None),
         ),
         results=EvalResults(total_scenes=0, total_trials=0),
         stats=EvalStats(
@@ -924,6 +984,9 @@ def eval_set(
     before_scoring: Callable[[TrialRecord, Scene], None] | None = None,
     grader: Grader | str | None = None,
     retry_attempts: int = 0,
+    environment_id: str | None = None,
+    environment_revision: str | None = None,
+    policy_checkpoint: str | None = None,
 ) -> tuple[bool, list[EvalLog]]:
     """Run a set of tasks and return ``(success, logs)`` (mirrors Inspect AI).
 
@@ -984,6 +1047,9 @@ def eval_set(
                     # would leave every eval_set log with no grader recorded.
                     grader=resolved_grader,
                     before_scoring=None if resolved_grader is not None else before_scoring,
+                    environment_id=environment_id,
+                    environment_revision=environment_revision,
+                    policy_checkpoint=policy_checkpoint,
                 )
             )
         except (SafetyAbort, EmbodimentFault):
@@ -996,6 +1062,9 @@ def eval_set(
                     embodiment,
                     seed=seed,
                     exc=exc,
+                    environment_id=environment_id,
+                    environment_revision=environment_revision,
+                    policy_checkpoint=policy_checkpoint,
                 )
             )
     success = all(log.status == "success" for log in logs)
